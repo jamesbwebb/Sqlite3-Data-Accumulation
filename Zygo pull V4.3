@@ -1,0 +1,254 @@
+#!usr/bin/python
+
+"""
+Created on Tue Dec  06 14:14:50 2022
+Updated on Fri Mar  08 16:04:24 2024
+
+@author: jamesw
+
+V4.3
+This creates a sqlite3 database
+This will create a CSV file containing multiple Mx calculations from all wafers
+
+Code is tested and working, will not run unless used in Mx software or disable all Mx libraries and associated code
+Checks against database and creates fresh csv file.
+
+"""
+
+import sqlite3
+import re
+import os.path
+import csv
+
+from zygo.units import Units	# these exist at the path 'C:\ProgramData\Zygo\Mx\Scripting\zygo' in the computer attatched to the zygo
+from zygo import mx
+import zygo.systemcommands as sc
+
+# Database file path, this is not an absolute path. Verify vs csv filepath to see if it should be.
+db_path = r'\1. Wafer Measurements\zygoPull.sqlite'
+
+# CSV Output filename.
+csvPath = r'\1. Wafer Measurements\zygoPull V4.csv'
+
+# Directory that pulls in to database, where we are looking for file to parse.
+main_dir = r'\1. Wafer Measurements'
+
+# Keeping the data in the same order as current csv file
+csvHeader = ('EPINumber','Step','SourceName','product','EWO','filelist','sag','power','pv','rms')
+
+# appPath is the zygo application used to create the files this program is intended to parse.
+appPath = r'\3inch_Wafer_Application.appx'
+
+def initDatabase():
+	conn = sqlite3.connect(db_path)			# 'db_path' absolute path of .sqlite file
+	cur = conn.cursor()						# The below code creates everything for initialization, sets up database schema.
+	cur.executescript('''
+	CREATE TABLE IF NOT EXISTS Ewo (
+		id				INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT UNIQUE,
+		num				INTEGER UNIQUE
+	);
+	CREATE TABLE IF NOT EXISTS Product (
+		id				INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT UNIQUE,
+		name			TEXT UNIQUE
+	);
+	CREATE TABLE IF NOT EXISTS Sourcename (
+		id				INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT UNIQUE,
+		operation		TEXT UNIQUE
+	);
+	CREATE TABLE IF NOT EXISTS Epinum (
+		id				INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT UNIQUE,
+		waferId			TEXT UNIQUE
+	);
+	CREATE TABLE IF NOT EXISTS File (
+		id				INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT UNIQUE,
+		abspath			TEXT UNIQUE,		
+		epinum_id		INTEGER,
+		step			INTEGER,
+		sourcename_id	INTEGER,
+		product_id		INTEGER,
+		ewo_id			INTEGER,
+		sag				REAL,
+		power			REAL,
+		pv				REAL,
+		rms				REAL
+	);
+	''')
+
+def isValid(file, root):										# Preprocess validation step 1
+	if file.endswith('.xyz'):									# The ensures we only check the database for files that should be included.
+		if "new" and "folder" not in root.lower():
+			return True
+	else:
+		return False
+
+def checkDatabase(checkpath):									# This is preprocess validation step 2
+	conn = sqlite3.connect(db_path)								# The absolute file path is passed in and checked against the database
+	cur = conn.cursor()
+	cur.execute('SELECT abspath FROM File WHERE abspath = ? ', (checkpath, ))
+	try:
+		if cur.fetchone()[0] == checkpath:						# If the file is in the database These are equal and we return True.
+			return True
+	except:														# Else we are trying to index a NoneType which blows up.
+		return False											# The try/except block supresses the explosion and returns False.
+
+def writeCsvfromDb():
+		conn = sqlite3.connect(db_path)
+		cur = conn.cursor()
+		cur.execute(''' SELECT Epinum.waferId, File.step, Sourcename.operation, Product.name, Ewo.num, File.abspath, File.sag, File.power, File.pv, File.rms
+			FROM File JOIN Ewo JOIN Epinum JOIN Sourcename Join Product
+			ON  File.epinum_id = Epinum.id  and File.sourcename_id = Sourcename.id and File.product_id = Product.id and File.ewo_id = Ewo.id
+			''')
+		rdata = cur.fetchall()								# returns a list of values returned by the sql qurey
+		tdata = getFileTotal()
+		with open(csvPath, 'w') as file:					# keeping the csv creation simple.
+			f = csv.writer(file)
+			f.writerow(csvHeader)							# Put in the header.
+			f.writerows(rdata)								# Put in all of the data.
+			f.writerow(['Files in Database = {} '.format(len(rdata)), 'Total .xyz files = {} '.format(tdata), '{0:.2f}% complete'.format((len(rdata) / tdata)*100)])
+			print('csv saved successfully')
+            
+def getFileTotal():									# This funcion exists to get a total number of .xyz files in the main_dir 
+    file_Counter = 0									# As a helper function for writeCsvfromDb
+    for root, dirs, files in os.walk(main_dir):
+        for file in files:
+            if file.endswith('.xyz'):
+                file_Counter += 1
+    return file_Counter
+
+
+class DataFile():
+
+	def getEnumStepSource(self, fileName):
+		p1 = '([a-z]\d+[a]\d{2})'
+		p2 = '(\d{1,2})'
+		if fileName.endswith('.xyz'):								# string.removesuffix('.xyz') python 3.9 and newer only
+			fileName = fileName[:-4]
+		if fileName.count('_') == 3:								# Pulled this from validation as a manner of checking name formatting
+			try:
+				file_list = fileName.lower().split('_')
+				if 'epi' in file_list:
+					file_list.remove('epi')
+				for count, i in enumerate(file_list):				# Iterate over the list we made from the filename
+					enum = re.findall(p1, file_list[count])			# Pulls out the EPI Number
+					if enum:
+						EPINumber = enum[0].upper()					# NonUnique ex. X1234A01	# Added to db as Epinum table with entry in File table
+						file_list.remove(enum[0])					# removes EPI Number from the list
+						break
+					else:
+						EPINumber = fileName						# using the full filename excluding the extension as a default value
+				for count, i in enumerate(file_list):
+					step = re.findall(p2, file_list[count])			# Pulls out the step number
+					if step:
+						Step = int(step[0])							# NonUnique ex. 34		# Added to db in File table
+						file_list.remove(step[0])					# removes step number from list
+						break
+					else:
+						Step = 0									# using '0' as default value
+				for count, i in enumerate(file_list):
+					if len(file_list) == 1 and file_list[0] != '':
+						SourceName = file_list[0].strip()			# NonUnique ex. RTA/N-Metal	# Added to db as Sourcename table with entry in File table
+					else:
+						SourceName = 'Undefined'					# using 'Undefined' as default value
+			except ValueError:
+				print('The following filename is formatted incorrectly\n{}\n Correct formatting example "X0000A00_EPI_01_Descriptive words"'.format(fileName))
+				EPINumber = fileName
+				Step = 0
+				SourceName = 'Undefined'
+		else:
+			EPINumber = fileName
+			Step = 0
+			SourceName = 'Undefined'
+		return EPINumber, Step, SourceName
+
+	def getFolderProductEwo(self, filePath):
+		p3 = '([a-z0-9 _\-]+) *ewo *(\d{5})'						# regex pattern to pull more data. Verified working, failstates untested
+		p4 = '(\d{5})'
+		rootsplit = filePath.split('\\')							# Cutting the absolute path into folders
+		Folder = rootsplit[-1]										# Selecting the last folder in the list
+		valid_fdata = re.findall(p3, Folder.lower())				# Returns a tuple (product, ewo)
+		valid_fdata2 = re.findall(p4, Folder)		
+		if valid_fdata:
+			Product = valid_fdata[0][0].capitalize()				# NonUnique ex. Mantaray	# Added to db as Product table with entry in File table
+			EWO = valid_fdata[0][1]									# NonUnique ex. 12345		# Added to db as Ewo table with entry in File table
+		elif valid_fdata2:
+			Product = Folder
+			EWO = valid_fdata2[0][0]
+		else:
+			Product = Folder
+			EWO = 0
+		return Folder, Product, EWO
+
+	def getOsPathData(self, file, root):
+		toggle = True
+		self.EPINumber, self.Step, self.SourceName = self.getEnumStepSource(file)
+		self.Folder, self.Product, self.EWO = self.getFolderProductEwo(root)
+		self.FilePath = root + '\\' + file							# Unique	# Added to db in File table
+		open_data_dir = sc.get_open_dir(sc.FileTypes.Data)
+		try:
+			mx.load_data(self.FilePath)											# Absolute path of file to be loaded. I think this is our issue
+		except:
+			toggle = False
+		if toggle == True:
+			path = ("Analysis", "Surface", "Surface Parameters")				# This is to save space (typed out words)
+			sag_path = path + ("Optical Parameters", "Sag")
+			power_path = path + ("Optical Parameters", "Power")
+			rms_path = path + ("Height Parameters", "RMS")
+			pv_path = path + ("Height Parameters", "PV")						# The below values are ~20 digit floats.
+			self.Power = mx.get_result_number(power_path, Units.MicroMeters)	# added to db as attribute of File table
+			self.Pv = mx.get_result_number(pv_path, Units.MicroMeters)			# added to db as attribute of File table
+			self.Rms = mx.get_result_number(rms_path, Units.MicroMeters)		# added to db as attribute of File table
+			self.Sag = mx.get_result_number(sag_path, Units.MicroMeters)		# added to db as attribute of File table
+		else:
+			self.Power = 0														# Added for an .xyz file not in the database with null values.
+			self.Pv = 0
+			self.Rms = 0
+			self.Sag = 0
+
+	def updateDatabase(self):													# Updates the database with everything pulled in from the getOsPathData method
+		conn = sqlite3.connect(db_path)
+		cur = conn.cursor()
+		cur.execute('''INSERT OR IGNORE INTO Ewo (num)
+			VALUES ( ? )''', (self.EWO, ) )
+		cur.execute('SELECT id FROM Ewo WHERE num = ? ', (self.EWO, ))
+		ewo_id = cur.fetchone()[0]
+
+		cur.execute('''INSERT OR IGNORE INTO Product (name)
+			VALUES ( ? )''', (self.Product, ) )
+		cur.execute('SELECT id FROM Product WHERE name = ? ', (self.Product, ))
+		product_id = cur.fetchone()[0]
+
+		cur.execute('''INSERT OR IGNORE INTO Sourcename (operation)
+			VALUES ( ? )''', (self.SourceName, ) )
+		cur.execute('SELECT id FROM Sourcename WHERE operation = ? ', (self.SourceName, ))
+		sourcename_id = cur.fetchone()[0]
+
+		cur.execute('''INSERT OR IGNORE INTO Epinum (waferId)
+			VALUES ( ? )''', (self.EPINumber, ) )
+		cur.execute('SELECT id FROM Epinum WHERE waferId = ? ', (self.EPINumber, ))
+		epinum_id = cur.fetchone()[0]
+
+		cur.execute('''INSERT OR IGNORE INTO File (abspath, epinum_id, step, sourcename_id, product_id, ewo_id, sag, power, pv, rms )
+			VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )''', (self.FilePath, epinum_id, self.Step, sourcename_id, product_id, ewo_id, self.Sag, self.Power, self.Pv, self.Rms ))
+		conn.commit()
+
+def main():
+	initDatabase()													# Checks to see if the database exists, if not it creates one with the correct schema.
+	open_app_dir = sc.get_open_dir(sc.FileTypes.Application)		# zygo.systemcommands, imported as sc
+	app_file_path = os.path.join(open_app_dir, appPath)				# appPath, zygo application file
+	mx.open_application(app_file_path)	
+	for root, dirs, files in os.walk(main_dir):
+		for file in files:
+			if isValid(file, root) == True:						# Should the file be part of this database?
+				if checkDatabase(root + '\\' + file) == False:	# Is the file already in this database?
+					workHorse = DataFile()							# initializing our class by getting os.path data to fill internal variables.
+					workHorse.getOsPathData(file, root)				# Gathering data using ospath and zygo to fill out our variables.
+					workHorse.updateDatabase()						# This will write all of the required data to our database.
+	writeCsvfromDb()												# Creates a csv if one doesn't exist, or overwrites. Fills with header and all data from Database.
+	print('Closing application ...')
+	mx.close_application()
+	if mx.is_application_open() == False:
+		print('Application Closed sucessfully.')
+	else:
+		print('Application still open.')
+	
+main()
